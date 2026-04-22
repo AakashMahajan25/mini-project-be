@@ -662,8 +662,8 @@ router.post("/users/deductEventCredits", auth, (req, res) => ok(res, null));
 
 app.use("/api", router);
 
+// Health check
 app.get("/", (req, res) => res.send("Frruit AI Backend running"));
-app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), timestamp: new Date().toISOString() }));
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SOCKET.IO — Streaming Chat

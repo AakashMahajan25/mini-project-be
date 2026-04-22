@@ -1,0 +1,302 @@
+version: "3.3"
+
+services:
+  api:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: api
+      PORT: 3000
+    depends_on:
+      - nats
+      - users
+      - stocks
+      - news
+      - plans
+      - order
+      - prompts
+      - watchlist
+      - topic
+      - contentPrompt
+      - eventCategories
+      - admin
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api-gw.rule=Host(`frruitapi.airrchip.com`)"
+      - "traefik.http.routers.api-gw.entrypoints=websecure"
+      - "traefik.http.routers.api-gw.tls.certresolver=myresolver"
+      - "traefik.http.services.api-gw.loadbalancer.server.port=3000"
+    networks:
+      - internal
+
+  users:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: user
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  stocks:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: stocks
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  news:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: news
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  plans:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: plans
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  order:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: order
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  prompts:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: prompts
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  watchlist:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: watchlist
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  topic:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: topic
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  contentPrompt:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: contentPrompt
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  eventCategories:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: eventCategories
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  admin:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: admin
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  promptLibrary:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: promptlibrary
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  financialRatios:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: financialRatios
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  companyFundamentals:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: companyFundamentals
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  corporateAnnouncements:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: corporateAnnouncement
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  capitalMarketNews:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: capitalMarketNews
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  cmotsMasters:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: cmotsMaster
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  financial5Year:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: financial5Year
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  pushNotification:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: pushNotification
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  greeter:
+    build:
+      context: .
+    image: frruit-be
+    env_file: docker-compose.env
+    environment:
+      SERVICES: greeter
+    depends_on:
+      - nats
+    networks:
+      - internal
+
+  nats:
+    image: nats:2
+    networks:
+      - internal
+
+  traefik:
+    image: traefik:v2.10
+    command:
+      - "--api.dashboard=true"              # dashboard (disable later in prod or secure it)
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=your@email.com"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"        # HTTP
+      - "443:443"      # HTTPS
+      - "8080:8080"    # Dashboard (optional)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    networks:
+      - internal
+      - default
+
+networks:
+  internal:
