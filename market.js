@@ -7,6 +7,7 @@
 
 const express = require("express");
 const { EventEmitter } = require("events");
+const { configured } = require("./ai");
 
 const SUMMARY_MODEL     = process.env.MARKET_AI_MODEL || "gpt-4.1-mini";
 const MOVERS_REFRESH_MS = 15 * 60 * 1000;
@@ -164,7 +165,7 @@ module.exports = function createMarket({ pool, openai, quotes, auth, ok, fail })
 
   // ─── AI market summary ──────────────────────────────────────────────────────
   async function generateSummary(market, { force = false } = {}) {
-    if (generating[market] || !process.env.OPENAI_API_KEY) return null;
+    if (generating[market] || !configured()) return null;
     const { rows: [last] } = await pool.query(`SELECT generated_at FROM market_summaries WHERE market=$1 ORDER BY generated_at DESC LIMIT 1`, [market]);
     if (!force && last && Date.now() - new Date(last.generated_at).getTime() < SUMMARY_TTL_MS) return null;
     generating[market] = true;

@@ -1,5 +1,7 @@
 "use strict";
 
+const { configured } = require("./ai");
+
 // Evidence safeguard. Every answer is checked against its sources before the user sees it:
 //   1. citations are parsed ([S#] = Frruit document store, [P1] = portfolio, links = web search)
 //   2. a verifier model splits the answer into claims and judges each one against the cited evidence
@@ -56,7 +58,8 @@ Split the answer into its atomic factual claims (at most 12; skip greetings, hea
   web         = it is cited only to web sources, so its text cannot be checked here
   uncited     = a specific fact, figure, date or event with no citation
   general     = widely known definitional or textbook knowledge (e.g. what a P/E ratio is) that needs no source
-answers_question = false if the answer mainly says the information could not be found or does not address the question.`;
+A statement that the sources do NOT contain something (e.g. "the document does not mention the CEO's salary") is not a factual claim: leave it out of claims.
+answers_question = false if the answer mainly says the information is not in the sources, could not be found or verified, or does not address the question, even when that statement is accurate. Set it true only if the answer actually provides the requested information.`;
 
 // ─── Citation parsing ─────────────────────────────────────────────────────────
 // Normalises "[S1, S3]" / "[S1; S2]" into "[S1][S3]" so every marker is a separate token, and moves
@@ -96,6 +99,17 @@ function sentences(text) {
 }
 
 // Fallback coverage when the verifier is unavailable: share of long sentences carrying any citation
+// Deterministic backstop: does the answer open by saying the information isn't available?
+// ("The document does not appear to provide…", "I could not find…", "No information is available…")
+const REFUSAL = /\b(?:(?:does|do|did)\s*(?:not|n't)\s+(?:appear\s+to\s+|seem\s+to\s+)?(?:provide|mention|contain|cover|include|specify|disclose|state|say|give|list|report|discuss|address|have)|(?:could|can)\s*(?:not|n't)\s+(?:find|locate|verify|confirm|determine)|unable\s+to\s+(?:find|locate|verify|confirm|determine)|no\s+(?:information|details|data|mention)\b|(?:is|are|was|were)\s+not\s+(?:available|mentioned|disclosed|provided|specified|covered|stated)|not\s+(?:covered|mentioned|disclosed|specified)\s+in)/i;
+function opensWithRefusal(text) {
+  const body = String(text || "").replace(/\[[SPW]\d+\]/g, "").replace(/^\s*>.*$/gm, "").trim();
+  const first = body.split(/(?<=[.!?])\s+|\n+/).find(s => s.trim()) || "";
+  // Only the opening clause: "X was 4.8 times; the report does not mention a target" is a real answer
+  const opening = first.split(/[;:]|,\s+(?:but|while|although|however|whereas)\b/i)[0];
+  return REFUSAL.test(opening);
+}
+
 function heuristicCoverage(text) {
   const list = sentences(text);
   if (!list.length) return 0;
@@ -133,7 +147,7 @@ module.exports = function createEvidence({ openai }) {
 
     let audit = null;
     try {
-      if (!process.env.OPENAI_API_KEY) throw new Error("no API key");
+      if (!configured()) throw new Error("no AI key configured");
       audit = await verify({ question, answer, evidence, webSources });
     } catch (e) {
       console.error("Answer verification failed:", e.message);
@@ -160,7 +174,7 @@ module.exports = function createEvidence({ openai }) {
     const unsupported = checkable.filter(c => c.verdict === "unsupported" || c.verdict === "uncited");
 
     if (!hasCitations) reasons.push("no_sources");
-    if (audit && audit.answers_question === false) reasons.push("insufficient_evidence");
+    if ((audit && audit.answers_question === false) || opensWithRefusal(answer)) reasons.push("insufficient_evidence");
     if (checkable.length && unsupported.length / checkable.length > MAX_UNSUPPORTED_SHARE) reasons.push("unsupported_claims");
     if (!audit) reasons.push("verification_unavailable");
     if (confidence < THRESHOLD) reasons.push("low_confidence");
@@ -220,3 +234,4 @@ module.exports.normaliseMarkers = normaliseMarkers;
 module.exports.citedMarkers = citedMarkers;
 module.exports.markdownLinks = markdownLinks;
 module.exports.stripUnknownMarkers = stripUnknownMarkers;
+module.exports.opensWithRefusal = opensWithRefusal;

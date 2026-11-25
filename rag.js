@@ -6,6 +6,7 @@
 
 const fs = require("fs/promises");
 const { extractPages, chunkPages } = require("./extract");
+const { configured } = require("./ai");
 
 const EMBED_MODEL    = process.env.EMBED_MODEL || "text-embedding-3-small";
 const EMBED_DIMS     = 1536; // fixed by the rag_chunks.embedding column
@@ -24,7 +25,7 @@ function chunk(arr, size) {
 const toVector = (arr) => `[${arr.join(",")}]`;
 
 module.exports = function createRag({ pool, openai }) {
-  const hasKey = () => Boolean(process.env.OPENAI_API_KEY);
+  const hasKey = configured;
   let syncingNews = false;
   let queue = Promise.resolve(); // uploads are processed one at a time
 
@@ -120,7 +121,7 @@ module.exports = function createRag({ pool, openai }) {
     if (!doc) throw new Error("Document not found");
     await pool.query(`UPDATE rag_documents SET status='processing', error=NULL WHERE id=$1`, [documentId]);
     try {
-      if (!hasKey()) throw new Error("OPENAI_API_KEY is not set, so the document cannot be embedded yet. Add the key and press Retry.");
+      if (!hasKey()) throw new Error("No AI key is set (AI_GATEWAY_API_KEY or OPENAI_API_KEY), so the document cannot be embedded yet. Add one and press Retry.");
       const buffer = await fs.readFile(doc.storage_path);
       const { kind, pages } = await extractPages(buffer, doc.filename);
       const chunks = chunkPages(pages);

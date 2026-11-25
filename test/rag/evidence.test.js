@@ -69,3 +69,20 @@ test("markers after the full stop move inside the sentence", () => {
   assert.strictEqual(normaliseMarkers("Debt to equity was 4.8 times. [S3] Profit rose.[S1][S2]"), "Debt to equity was 4.8 times [S3]. Profit rose [S1][S2].");
   assert.strictEqual(normaliseMarkers("Revenue grew [S1]."), "Revenue grew [S1].");
 });
+
+test("answers that open with a refusal are detected", () => {
+  const { opensWithRefusal } = createEvidence;
+  for (const t of [
+    "The document does not appear to provide information on the tax rate paid by the company [S1].",
+    "The document doesn't mention the statutory auditors [S1].",
+    "I could not find the CEO's salary in the sources.",
+    "No information is available about advertising spend.",
+    "The number of employees is not disclosed in the report [S1].",
+    "> ⚠️ **UNCERTAIN** — banner\n\nThe document does not specify which states have the most branches; it only states 14 states [S1].",
+  ]) assert.ok(opensWithRefusal(t), t);
+  for (const t of [
+    "Total revenue for FY2025 was Rs 4,820 crore [S1].",
+    "The company did not pay an interim dividend in FY2025 [S1].",
+    "Debt to equity stood at 4.8 times; the report does not mention a target [S1].",
+  ]) assert.ok(!opensWithRefusal(t), t);
+});

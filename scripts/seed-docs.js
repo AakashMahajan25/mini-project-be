@@ -9,7 +9,7 @@ const crypto = require("crypto");
 const fs = require("fs/promises");
 const path = require("path");
 const { Pool } = require("pg");
-const OpenAI = require("openai");
+const { createAI, configured } = require("../ai");
 const createRag = require("../rag");
 const { detectKind, SUPPORTED } = require("../extract");
 const { titleFromFilename } = require("../documents");
@@ -19,12 +19,12 @@ const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "
 
 (async () => {
   const force = process.argv.includes("--force");
-  if (!process.env.OPENAI_API_KEY) {
-    console.error("OPENAI_API_KEY is not set in frruit-be/.env; seed documents need it for embeddings.");
+  if (!configured()) {
+    console.error("No AI key in frruit-be/.env (AI_GATEWAY_API_KEY or OPENAI_API_KEY); seed documents need it for embeddings.");
     process.exit(1);
   }
   const pool = new Pool({ connectionString: process.env.POSTGRES_URI });
-  const rag = createRag({ pool, openai: new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) });
+  const rag = createRag({ pool, openai: createAI() });
   await rag.initDB();
   const dest = path.join(UPLOAD_DIR, "seed");
   await fs.mkdir(dest, { recursive: true });

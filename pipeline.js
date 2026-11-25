@@ -7,8 +7,9 @@
 //   the answer, its citations and its review status.
 
 const { normaliseMarkers, citedMarkers, stripUnknownMarkers } = require("./evidence");
+const { configured, defaultChatModel } = require("./ai");
 
-const CHAT_MODEL    = process.env.CHAT_MODEL || "gpt-5-search-api";
+const CHAT_MODEL    = process.env.CHAT_MODEL || defaultChatModel();
 const DOCS_MODEL    = process.env.DOCS_CHAT_MODEL || "gpt-4.1-mini";
 const REWRITE_MODEL = process.env.RAG_AI_MODEL || "gpt-4.1-mini";
 const TOP_K         = Number(process.env.RAG_TOP_K) || 6;
@@ -65,12 +66,14 @@ function hitLabel(hit) {
   return [`"${hit.title}"`, kind, pages, hit.heading ? `section "${hit.heading}"` : null, when].filter(Boolean).join(" · ");
 }
 
-function extractWebSources(annotations = []) {
-  if (!Array.isArray(annotations)) return [];
+// Web sources from url_citation annotations, plus any other Markdown links in the answer
+function extractWebSources(annotations = [], text = "") {
   const seen = new Set();
-  return annotations
+  const fromAnnotations = (Array.isArray(annotations) ? annotations : [])
     .filter(a => a.type === "url_citation")
-    .map(a => ({ url: a.url_citation?.url || a.url, title: a.url_citation?.title || a.title || "" }))
+    .map(a => ({ url: a.url_citation?.url || a.url, title: a.url_citation?.title || a.title || "" }));
+  const fromLinks = [...String(text).matchAll(/\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g)].map(m => ({ url: m[2], title: m[1] }));
+  return [...fromAnnotations, ...fromLinks]
     .filter(s => s.url && !seen.has(s.url) && seen.add(s.url))
     .map((s, i) => ({ ...s, marker: `W${i + 1}` }));
 }
@@ -102,7 +105,7 @@ module.exports = function createPipeline({ pool, openai, lang, portfolio, rag, e
 
   // "What about its debt?" → "Infosys debt levels FY2025"
   async function standaloneQuery(history, question) {
-    if (!history.length || !process.env.OPENAI_API_KEY) return question;
+    if (!history.length || !configured()) return question;
     try {
       const recent = history.slice(-6).map(h => `${h.person === "bot" ? "Assistant" : "User"}: ${String(h.text).slice(0, 600)}`).join("\n");
       const completion = await openai.chat.completions.create({
@@ -186,17 +189,15 @@ module.exports = function createPipeline({ pool, openai, lang, portfolio, rag, e
 
     onStage("answering", { sources: evidenceItems.length });
     const model = docMode ? DOCS_MODEL : CHAT_MODEL;
-    const completion = await openai.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: system },
-        ...history.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
-        { role: "user", content: detected.english },
-      ],
-      ...(docMode ? { temperature: 0.1 } : { web_search_options: {} }),
-    });
-    const msg = completion.choices[0].message;
-    const webSources = docMode ? [] : extractWebSources(msg.annotations);
+    const messages = [
+      { role: "system", content: system },
+      ...history.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
+      { role: "user", content: detected.english },
+    ];
+    const msg = docMode
+      ? (await openai.chat.completions.create({ model, messages, temperature: 0.1 })).choices[0].message
+      : await openai.webSearchChat({ model, messages });
+    const webSources = docMode ? [] : extractWebSources(msg.annotations, msg.content);
     const known = new Set(evidenceItems.map(e => e.marker));
     const { text: rawAnswer } = stripUnknownMarkers(normaliseMarkers(msg.content || ""), known);
     const cited = citedMarkers(rawAnswer);

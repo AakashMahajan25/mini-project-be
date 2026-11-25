@@ -1,18 +1,20 @@
 "use strict";
 
+// Load .env before any module reads process.env at require time
+require("dotenv").config();
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
-const OpenAI = require("openai");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
 const createNews = require("./news");
 const createQuotes = require("./quotes");
 const createLanguage = require("./language");
 const createPortfolio = require("./portfolio");
-require("dotenv").config();
+const { createAI } = require("./ai");
 const createRag = require("./rag");
 const createAnswers = require("./answers");
 const createDocuments = require("./documents");
@@ -32,8 +34,9 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "frruit_secret";
 
 const pool = new Pool({ connectionString: process.env.POSTGRES_URI });
-// The server boots without a key (AI features report themselves unavailable until OPENAI_API_KEY is set)
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "not-configured" });
+// Vercel AI Gateway when AI_GATEWAY_API_KEY is set, else OpenAI. The server boots without a key;
+// AI features report themselves unavailable until one is set.
+const openai = createAI();
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -499,6 +502,8 @@ initDB()
     rag.syncNews();
     console.log(`\n🚀  Frruit AI Backend  →  http://localhost:${PORT}`);
     console.log(`📡  Socket.IO          →  http://localhost:${PORT}/chat`);
-    console.log(`📧  OTPs sent via ${process.env.SMTP_USER}\n`);
+    console.log(`📧  OTPs sent via ${process.env.SMTP_USER}`);
+    console.log(`🤖  AI provider        →  ${openai.provider === "gateway" ? "Vercel AI Gateway" : "OpenAI"}\n`);
+    openai.credits().then(c => c && console.log(`💳  AI Gateway balance: $${c.balance.toFixed(2)}`)).catch(() => {});
   }))
   .catch((err) => { console.error("DB init failed:", err.message); process.exit(1); });

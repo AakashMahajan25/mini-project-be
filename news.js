@@ -2,6 +2,7 @@
 
 const express = require("express");
 const Parser = require("rss-parser");
+const { configured } = require("./ai");
 
 // ─── Feed sources ─────────────────────────────────────────────────────────────
 const FEEDS = [
@@ -186,7 +187,7 @@ module.exports = function createNews({ pool, openai, auth, ok, fail, onRefresh =
 
   // Tags untagged articles with sentiment + tickers in small batches
   async function enrichPending() {
-    if (!process.env.OPENAI_API_KEY) return 0;
+    if (!configured()) return 0;
     const { rows } = await pool.query(
       `SELECT id, market, title, summary FROM news_articles
        WHERE sentiment IS NULL ORDER BY published_at DESC LIMIT $1`,

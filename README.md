@@ -37,6 +37,21 @@ question ─► language.js   detect language, translate to English
 | `portfolio.js` | Holdings, live valuation, portfolio context for chat |
 | `voice.js` | Speech-to-text fallback for browsers without the Web Speech API |
 
+### AI provider
+
+`ai.js` builds the single AI client that every module uses:
+
+- **Vercel AI Gateway** whenever `AI_GATEWAY_API_KEY` is set (OpenAI-compatible API at `https://ai-gateway.vercel.sh/v1`).
+- **OpenAI** directly with `OPENAI_API_KEY` otherwise.
+
+`AI_PROVIDER=gateway|openai` forces one of them. Modules use plain model ids such as `gpt-4.1-mini`; on the gateway these become `openai/gpt-4.1-mini`.
+
+How the features map onto each provider:
+
+- **Web-search chat:** uses the Responses API with OpenAI's native `web_search` tool. The model searches when the retrieved documents and news don't cover the question, and returns URL citations. On OpenAI without the gateway, the `*-search-*` models search through Chat Completions instead.
+- **Voice:** uses the gateway's transcription endpoint (`/v4/ai/transcription-model`).
+- **Balance:** `ai.credits()` reads the gateway balance, which is logged on boot.
+
 Socket.IO namespaces:
 
 - `/chat` streams answers. Events: `stage`, `response`, `end`.
@@ -71,7 +86,7 @@ Answer statuses are `CANDIDATE`, `UNCERTAIN`, `UNDER_REVIEW`, `APPROVED`, `REJEC
      -v frruit-pgvector-data:/var/lib/postgresql/data -p 127.0.0.1:5435:5432 pgvector/pgvector:pg16
    ```
    The server creates the tables and the `vector` extension on boot.
-2. **Environment.** Copy `.env.example` to `.env` and fill it in. `OPENAI_API_KEY` is required for chat, embeddings, verification, translation, tagging and voice. Without it the server still boots, but every AI feature reports that it is unavailable.
+2. **Environment.** Copy `.env.example` to `.env` and fill it in. Set `AI_GATEWAY_API_KEY` (or `OPENAI_API_KEY`); it is required for chat, embeddings, verification, translation, tagging and voice. Without a key the server still boots, but every AI feature reports that it is unavailable.
 3. `npm install`, then `npm run dev`.
 4. **Optional shared corpus.** Put PDFs in `seed-docs/`, then run `npm run seed:docs`.
 
@@ -90,4 +105,4 @@ Uploaded files are stored in `storage/documents/`, which is gitignored. Set `UPL
   - latency
 
   The report is written to `test/eval/results/`. Pass `-- --api http://host:port` to target another server.
-- **Offline testing.** `node test/mock-openai.js` starts a fake OpenAI API on :4010. Run the backend with `OPENAI_BASE_URL=http://127.0.0.1:4010/v1 OPENAI_API_KEY=mock`. **Use a separate database for this**: the mock's embeddings are not compatible with real ones. Put `MOCK_NOCITE` in a question to get an uncited answer, which exercises the UNCERTAIN path.
+- **Offline testing.** `node test/mock-openai.js` starts a fake OpenAI API on :4010. Run the backend with `AI_PROVIDER=openai OPENAI_BASE_URL=http://127.0.0.1:4010/v1 OPENAI_API_KEY=mock`. **Use a separate database for this**: the mock's embeddings are not compatible with real ones. Put `MOCK_NOCITE` in a question to get an uncited answer, which exercises the UNCERTAIN path.
