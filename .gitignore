@@ -64,3 +64,8 @@ typings/
 .idea
 
 .vscode
+
+# Uploaded documents (RAG store files)
+storage/
+# Evaluation reports (npm run eval)
+test/eval/results/

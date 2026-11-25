@@ -102,7 +102,8 @@ module.exports = function createLanguage({ openai }) {
     return `Translate the assistant's answer below from English into ${target.name}. ${scriptRule}
 Rules:
 - Preserve the Markdown structure exactly: headings, lists, bold/italics, tables, links and line breaks.
-- Keep numbers, currency symbols, percentages, dates, ticker symbols, company names, URLs and citation markers such as [1] unchanged.
+- Keep numbers, currency symbols, percentages, dates, ticker symbols, company names, URLs and citation markers such as [S1], [P1] and [1] unchanged, in the same positions.
+- Keep the word UNCERTAIN in English and keep the warning banner, the "not verified" list and the closing note.
 - Keep widely used financial terms (P/E, EBITDA, EPS, NIFTY, Sensex, IPO, ETF) in English where speakers normally do.
 - Do not add, drop or soften any information, caveat or disclaimer.
 - Output only the translation.`;

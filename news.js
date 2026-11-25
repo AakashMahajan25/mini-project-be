@@ -108,7 +108,10 @@ function decodeCursor(cursor) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-module.exports = function createNews({ pool, openai, auth, ok, fail }) {
+// Optional API source: Finnhub general market news (set FINNHUB_API_KEY to enable)
+const FINNHUB_URL = "https://finnhub.io/api/v1/news?category=general";
+
+module.exports = function createNews({ pool, openai, auth, ok, fail, onRefresh = () => {} }) {
   let lastRefreshAt = null;
   let refreshing = false;
 
@@ -145,15 +148,40 @@ module.exports = function createNews({ pool, openai, auth, ok, fail }) {
       rows.push([feed.market, feed.category, feed.source, title, link,
         cleanText(item.contentSnippet || item.content || item.summary || ""), pickImage(item), toDate(item).toISOString()]);
     }
-    if (!rows.length) return 0;
+    return insertArticles(rows);
+  }
+
+  // rows: [market, category, source, title, link, summary, image_url, published_at] → inserted [{ id, market }]
+  async function insertArticles(rows) {
+    if (!rows.length) return [];
     const cols = rows[0].map((_, i) => rows.map(r => r[i]));
     const r = await pool.query(
       `INSERT INTO news_articles(market, category, source, title, link, summary, image_url, published_at)
        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[])
-       ON CONFLICT (link) DO NOTHING`,
+       ON CONFLICT (link) DO NOTHING
+       RETURNING id, market`,
       cols
     );
-    return r.rowCount;
+    return r.rows;
+  }
+
+  async function ingestFinnhub() {
+    const res = await fetch(`${FINNHUB_URL}&token=${encodeURIComponent(process.env.FINNHUB_API_KEY)}`, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const items = await res.json();
+    const cutoff = Date.now() - RETENTION_DAYS * 86400000;
+    const seen = new Set();
+    const rows = [];
+    for (const item of Array.isArray(items) ? items : []) {
+      const link = item.url && normalizeLink(item.url);
+      const title = cleanText(item.headline || "", 300);
+      const published = new Date(Number(item.datetime) * 1000);
+      if (!link || !title || seen.has(link) || isNaN(published) || published.getTime() < cutoff) continue;
+      seen.add(link);
+      rows.push(["US", "Markets", item.source ? `${item.source} (Finnhub)` : "Finnhub", title, link,
+        cleanText(item.summary || ""), item.image || null, published.toISOString()]);
+    }
+    return insertArticles(rows);
   }
 
   // Tags untagged articles with sentiment + tickers in small batches
@@ -249,10 +277,13 @@ module.exports = function createNews({ pool, openai, auth, ok, fail }) {
     if (refreshing) return;
     refreshing = true;
     try {
-      const results = await Promise.allSettled(FEEDS.map(ingestFeed));
-      const added = results.reduce((n, r) => n + (r.status === "fulfilled" ? r.value : 0), 0);
+      const sources = [...FEEDS.map(f => ({ name: `${f.source}/${f.category}`, run: () => ingestFeed(f) }))];
+      if (process.env.FINNHUB_API_KEY) sources.push({ name: "Finnhub API", run: ingestFinnhub });
+      const results = await Promise.allSettled(sources.map(src => src.run()));
+      const inserted = results.flatMap(r => (r.status === "fulfilled" ? r.value : []));
+      const added = inserted.length;
       const failed = results
-        .map((r, i) => (r.status === "rejected" ? `${FEEDS[i].source}/${FEEDS[i].category} (${r.reason?.message})` : null))
+        .map((r, i) => (r.status === "rejected" ? `${sources[i].name} (${r.reason?.message})` : null))
         .filter(Boolean);
       await pool.query(`DELETE FROM news_articles WHERE published_at < NOW() - make_interval(days => $1)`, [RETENTION_DAYS]);
       lastRefreshAt = new Date();
@@ -263,6 +294,13 @@ module.exports = function createNews({ pool, openai, auth, ok, fail }) {
         if (tagged) console.log(`🏷️   News tagged: ${tagged} articles`);
       } catch (e) {
         console.error("News tagging failed:", e.message);
+      }
+
+      const byMarket = inserted.reduce((acc, r) => ({ ...acc, [r.market]: (acc[r.market] || 0) + 1 }), { IN: 0, US: 0 });
+      try {
+        await onRefresh({ added, byMarket, at: lastRefreshAt });
+      } catch (e) {
+        console.error("News refresh hook failed:", e.message);
       }
     } catch (e) {
       console.error("News refresh failed:", e.message);
@@ -308,6 +346,22 @@ module.exports = function createNews({ pool, openai, auth, ok, fail }) {
         categories: CATEGORIES.filter(c => FEEDS.some(f => f.market === market && f.category === c)),
         lastUpdated: lastRefreshAt,
       });
+    } catch (e) {
+      fail(res, e.message, 500);
+    }
+  });
+
+  // How many articles arrived after `since` (the newest one the client has) — drives the "N new stories" pill
+  router.get("/updates", auth, async (req, res) => {
+    try {
+      const market = (req.query.market || "IN").toUpperCase() === "US" ? "US" : "IN";
+      const since = new Date(req.query.since);
+      if (isNaN(since)) return fail(res, "since must be an ISO date");
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS count, MAX(published_at) AS latest FROM news_articles WHERE market=$1 AND published_at > $2`,
+        [market, since.toISOString()]
+      );
+      ok(res, { count: r.rows[0].count, latest_published_at: r.rows[0].latest, lastUpdated: lastRefreshAt });
     } catch (e) {
       fail(res, e.message, 500);
     }

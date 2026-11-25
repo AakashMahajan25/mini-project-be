@@ -1,0 +1,40 @@
+{
+  "document": "test/fixtures/acme_annual_report.pdf",
+  "notes": "Acme Sample Finance is a fictional test document (3 pages). 'page' = the page that holds the answer; 'expect' = the answer text that must appear.",
+  "document_questions": [
+    { "q": "What was Acme Sample Finance's total revenue for FY2025?", "page": 1, "expect": "4,820" },
+    { "q": "By how much did revenue grow over FY2024?", "page": 1, "expect": "14" },
+    { "q": "What was the net profit in FY2025?", "page": 1, "expect": "912" },
+    { "q": "What final dividend did the board recommend?", "page": 1, "expect": "18" },
+    { "q": "How much did the loan book grow and to what size?", "page": 2, "expect": "38,400" },
+    { "q": "What were gross non-performing assets at year end?", "page": 2, "expect": "2.1" },
+    { "q": "What was the cost of funds?", "page": 2, "expect": "7.4" },
+    { "q": "How many branches does the company have after the expansion?", "page": 2, "expect": "1,050" },
+    { "q": "What share of the loan book is vehicle finance?", "page": 3, "expect": "46" },
+    { "q": "What was the debt to equity ratio at the end of FY2025?", "page": 3, "expect": "4.8" }
+  ],
+  "unanswerable_document_questions": [
+    "What is the CEO's annual salary?",
+    "How many employees does the company have?",
+    "What was the share price on the last trading day?",
+    "Who are the statutory auditors?",
+    "What is the company's credit rating from CRISIL?",
+    "How much did the company spend on advertising?",
+    "What is the dividend payout ratio for FY2023?",
+    "Which states have the most branches?",
+    "What is the tax rate paid by the company?",
+    "Who won the football world cup?"
+  ],
+  "chat_questions": [
+    "What are the latest developments in Indian stock markets today?",
+    "What is the latest news on the Reserve Bank of India?",
+    "What happened to crude oil prices recently?",
+    "What is the latest news about Reliance Industries?",
+    "How are US technology stocks performing this week?",
+    "What is the latest news about inflation in India?",
+    "What are analysts saying about the Nifty 50 outlook?",
+    "What is the latest news about the US Federal Reserve?",
+    "What did Acme Sample Finance report for net profit in FY2025?",
+    "What are the key risks for Acme Sample Finance?"
+  ]
+}

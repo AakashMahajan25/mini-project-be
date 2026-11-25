@@ -13,6 +13,13 @@ const createQuotes = require("./quotes");
 const createLanguage = require("./language");
 const createPortfolio = require("./portfolio");
 require("dotenv").config();
+const createRag = require("./rag");
+const createAnswers = require("./answers");
+const createDocuments = require("./documents");
+const createEvidence = require("./evidence");
+const createPipeline = require("./pipeline");
+const createMarket = require("./market");
+const createVoice = require("./voice");
 
 const app = express();
 const server = http.createServer(app);
@@ -25,7 +32,8 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "frruit_secret";
 
 const pool = new Pool({ connectionString: process.env.POSTGRES_URI });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// The server boots without a key (AI features report themselves unavailable until OPENAI_API_KEY is set)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "not-configured" });
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -122,118 +130,29 @@ function auth(req, res, next) {
   }
 }
 
-const news = createNews({ pool, openai, auth, ok, fail });
 const quotes = createQuotes({ auth, ok, fail });
 const lang = createLanguage({ openai });
 const portfolio = createPortfolio({ pool, openai, auth, ok, fail, quotes });
+const rag = createRag({ pool, openai });
+const answers = createAnswers({ pool, auth, ok, fail });
+const documents = createDocuments({ pool, rag, answers, auth, ok, fail });
+const evidence = createEvidence({ openai });
+const pipeline = createPipeline({ pool, openai, lang, portfolio, rag, evidence, answers });
+const market = createMarket({ pool, openai, quotes, auth, ok, fail });
+const voice = createVoice({ openai, auth, ok, fail });
+const live = io.of("/live");
 
-const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-5-search-api";
-
-// ─── System Prompts ───────────────────────────────────────────────────────────
-const SYSTEM_PROMPTS = {
-  fund:     "You are a financial analyst specializing in Indian and US stock markets. Answer questions about company fundamentals, financial ratios, earnings, and valuations. Be concise and accurate.",
-  news:     "You are a knowledgeable market analyst. Answer questions about financial markets, company news, economic indicators, and investment topics using your training knowledge.",
-  news_bing:"You are a knowledgeable market analyst. Answer questions about financial markets, company news, and economic events.",
-  youtube:  "You are a financial content analyst. Summarize and explain financial content clearly and concisely.",
-  reddit:   "You are a market sentiment analyst. Provide balanced insights on investor sentiment and market discussions.",
-  screener: "You are a stock screening analyst. Help users find and analyze stocks based on financial criteria.",
-  portfolio: [
-    "You are Frruit's portfolio analyst. The user's holdings, valued at live prices, are listed below.",
-    "Those figures are authoritative: use them exactly for any value, P&L, return, weight or allocation, never recompute them differently, and never invent holdings the user does not have.",
-    "Use web search for recent news, results, guidance or events affecting these holdings when the question calls for it, and cite the sources.",
-    "Explain risks factually: concentration, sector exposure, volatility (beta), valuation (P/E), currency exposure, upcoming earnings.",
-    "Do not tell the user to buy, sell or hold any security and give no price targets; frame observations as points to consider.",
-    "If the data below cannot answer the question, say what is missing. Do not add a disclaimer; one is appended automatically.",
-  ].join(" "),
-  default:  "You are a helpful financial assistant specializing in stock markets, investment analysis, and financial planning.",
-};
-
-function sysPrompt(flag) {
-  return SYSTEM_PROMPTS[flag] || SYSTEM_PROMPTS.default;
-}
-
-const PORTFOLIO_DISCLAIMER = "_This is informational analysis of your holdings, not investment advice._";
-const EMPTY_PORTFOLIO_ANSWER = "Your portfolio is empty, so there is nothing to analyse yet. Add your holdings on the **Portfolio** page (symbol, quantity and average buy price), then ask again.";
-
-function extractSources(annotations = []) {
-  if (!Array.isArray(annotations)) return [];
-  return annotations
-    .filter(a => a.type === "url_citation")
-    .map(a => ({
-      source_url: a.url_citation?.url || a.url,
-      heading:    a.url_citation?.title || a.title || "",
-      title:      a.url_citation?.title || a.title || "",
-    }));
-}
-
-// Latest `limit` turns, oldest first, in English (the model always works in English)
-async function getHistory(userId, promptId, limit = 10) {
-  const r = await pool.query(
-    `SELECT person, COALESCE(text_en, text) AS text FROM ai_prompt_history
-     WHERE user_id=$1 AND prompt_id=$2 AND active=true AND type='text'
-     ORDER BY id DESC LIMIT $3`,
-    [userId, promptId, limit]
-  );
-  return r.rows.reverse();
-}
-
-// One chat turn through the multilingual pipeline:
-// detect language → translate question to English → answer in English (web search, plus
-// portfolio context for the portfolio focus) → caller translates the answer back.
-// Saves the user's message; returns the English answer for the caller to translate and save.
-async function prepareTurn({ userId, promptId, message, flag, language }) {
-  const detected = await lang.detect(message);
-  const target = lang.resolveTarget(language, detected);
-  const history = await getHistory(userId, promptId);
-
-  await pool.query(
-    `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, language, text_en)
-     VALUES($1,$2,'user',$3,'text',$4,$5,$6)`,
-    [userId, promptId, message, flag, detected.code, detected.english !== message ? detected.english : null]
-  );
-
-  let context = null;
-  if (flag === "portfolio") {
-    context = await portfolio.buildContext(userId);
-    if (context.empty) return { englishAnswer: EMPTY_PORTFOLIO_ANSWER, sources: [], detected, target };
-  }
-
-  const system = [
-    sysPrompt(flag),
-    detected.code !== "en" ? `The user's message was translated from ${detected.name}. Answer in English; the answer is translated for them afterwards.` : null,
-    context?.text,
-  ].filter(Boolean).join("\n\n");
-
-  const completion = await openai.chat.completions.create({
-    model: CHAT_MODEL,
-    messages: [
-      { role: "system", content: system },
-      ...history.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
-      { role: "user", content: detected.english },
-    ],
-    web_search_options: {},
-  });
-  const msg = completion.choices[0].message;
-  let englishAnswer = msg.content || "";
-  if (flag === "portfolio") englishAnswer = `${englishAnswer.trim()}\n\n${PORTFOLIO_DISCLAIMER}`;
-  return { englishAnswer, sources: extractSources(msg.annotations), detected, target };
-}
-
-async function saveBotAnswer({ userId, promptId, flag, answer, turn }) {
-  const translated = turn.target.code !== "en";
-  await pool.query(
-    `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, link, language, text_en)
-     VALUES($1,$2,'bot',$3,'text',$4,$5,$6,$7)`,
-    [userId, promptId, answer, flag, JSON.stringify(turn.sources), turn.target.code, translated ? turn.englishAnswer : null]
-  );
-  return {
-    language: turn.target.code,
-    language_name: turn.target.name,
-    detected_language: turn.detected.code,
-    translated,
-    text_en: translated ? turn.englishAnswer : null,
-  };
-}
+// After each news refresh: embed the new articles, tell connected clients, refresh the AI market summary
+const news = createNews({
+  pool, openai, auth, ok, fail,
+  onRefresh: async ({ added, byMarket, at }) => {
+    if (added) live.emit("news:new", { added, byMarket, at });
+    await rag.syncNews();
+    market.onNews();
+  },
+});
+market.events.on("movers", (payload) => live.emit("market:movers", payload));
+market.events.on("summary", (payload) => live.emit("market:summary", payload));
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
@@ -321,9 +240,10 @@ router.post("/users/resendOtp", async (req, res) => {
 
 router.get("/users/userDetails", auth, async (req, res) => {
   const r = await pool.query(
-    `SELECT user_id, name, email FROM ai_users WHERE user_id=$1`,
+    `SELECT user_id, name, email, role FROM ai_users WHERE user_id=$1`,
     [req.user.user_id]
   );
+  if (r.rows[0]) r.rows[0].role = await answers.roleOf(req.user.user_id);
   ok(res, r.rows[0] || null);
 });
 
@@ -354,7 +274,7 @@ router.get("/users/getAvaliableCredit", auth, async (req, res) => {
 router.get("/prompts/getPrompts", auth, async (req, res) => {
   const r = await pool.query(
     `SELECT prompt_id, prompt_text, "createdAt" FROM ai_prompts
-     WHERE user_id=$1 AND active=true ORDER BY "createdAt" DESC`,
+     WHERE user_id=$1 AND active=true AND kind='chat' ORDER BY "createdAt" DESC`,
     [req.user.user_id]
   );
   ok(res, groupByDate(r.rows));
@@ -373,14 +293,8 @@ router.post("/prompts/addPrompts", auth, async (req, res) => {
 router.get("/prompts/getPromptHistory", auth, async (req, res) => {
   const { prompt_id } = req.query;
   if (!prompt_id) return fail(res, "prompt_id required");
-  const r = await pool.query(
-    `SELECT id as prompt_history_id, prompt_id, user_id, person, text, type, focus_type, link, active, "createdAt", language, text_en
-     FROM ai_prompt_history
-     WHERE user_id=$1 AND prompt_id=$2 AND active=true
-     ORDER BY id ASC`,
-    [req.user.user_id, prompt_id]
-  );
-  ok(res, { rows: r.rows, count: r.rowCount });
+  const rows = await answers.historyWithAnswers(req.user.user_id, prompt_id);
+  ok(res, { rows, count: rows.length });
 });
 
 router.delete("/prompts/deletePrompt", auth, async (req, res) => {
@@ -394,7 +308,7 @@ router.get("/prompts/searchPrompts", auth, async (req, res) => {
   const { prompt } = req.query;
   const r = await pool.query(
     `SELECT prompt_id, prompt_text, "createdAt" FROM ai_prompts
-     WHERE user_id=$1 AND active=true AND prompt_text ILIKE $2 ORDER BY "createdAt" DESC`,
+     WHERE user_id=$1 AND active=true AND kind='chat' AND prompt_text ILIKE $2 ORDER BY "createdAt" DESC`,
     [req.user.user_id, `%${prompt || ""}%`]
   );
   ok(res, groupByDate(r.rows));
@@ -402,28 +316,21 @@ router.get("/prompts/searchPrompts", auth, async (req, res) => {
 
 router.get("/prompts/searchSuggestedQuestionPrompts", auth, (req, res) => ok(res, []));
 
-// REST chat (screener flag — uses web search)
-router.post("/prompts/triggerChat", auth, async (req, res) => {
+// REST chat: same pipeline as the socket, answered in one response
+async function restChat(req, res) {
   try {
     const { message, prompt_id, flag, language } = req.body;
     if (!message || !prompt_id) return fail(res, "message and prompt_id required");
-    const userId = req.user.user_id;
-
-    const pr = await pool.query(
-      `SELECT 1 FROM ai_prompts WHERE prompt_id=$1 AND user_id=$2 AND active=true`,
-      [prompt_id, userId]
-    );
-    if (!pr.rowCount) return fail(res, "Prompt not found", 404);
-
-    const turn = await prepareTurn({ userId, promptId: prompt_id, message, flag, language });
+    const turn = await pipeline.runTurn({ userId: req.user.user_id, promptId: prompt_id, message, flag, language });
     const text = await lang.translate(turn.englishAnswer, turn.target);
-    const meta = await saveBotAnswer({ userId, promptId: prompt_id, flag, answer: text, turn });
-
-    ok(res, { data: text, link: turn.sources, focus_type: flag, ...meta });
+    const meta = await pipeline.finishTurn(turn, text);
+    ok(res, { data: text, link: meta.citations.filter(c => c.cited), focus_type: turn.flag, ...meta });
   } catch (e) {
-    fail(res, e.message, 500);
+    fail(res, e.message, e.code === 404 ? 404 : 500);
   }
-});
+}
+
+router.post("/prompts/triggerChat", auth, (req, res) => restChat(req, res));
 
 router.post("/prompts/triggerGraph", auth, (req, res) =>
   fail(res, "Graph generation coming soon.")
@@ -447,131 +354,27 @@ router.get("/promptlibrary/getPrompts", auth, (req, res) => {
 router.post("/contentPrompt/triggerContentPrompt", auth, (req, res) =>
   ok(res, { data: "Link summarization coming soon.", prompt_id: 1 })
 );
-router.get("/contentPrompt/getSignedUrl", auth, (req, res) =>
-  fail(res, "Document upload coming soon.")
-);
-router.post("/contentPrompt/addDocument", auth, (req, res) =>
-  fail(res, "Document processing coming soon.")
-);
-router.post("/contentPrompt/triggerDocumentChat", auth, (req, res) =>
-  ok(res, "Document Q&A coming soon.")
-);
-router.get("/contentPrompt/getContentPromptHistory", auth, (req, res) => ok(res, []));
-router.get("/contentPrompt/getContentPromptHistoryByContentPromptId", auth, (req, res) => ok(res, []));
-router.get("/contentPrompt/searchContentPrompts", auth, (req, res) => ok(res, []));
-router.delete("/contentPrompt/deleteContentPrompt", auth, (req, res) => ok(res, null, "Deleted"));
+router.use("/contentPrompt", documents.contentRouter);
+// Document Q&A (Market Content GPT): answers only from the attached document, with page citations
+router.post("/contentPrompt/triggerDocumentChat", auth, async (req, res) => {
+  try {
+    const { message, prompt_id, language } = req.body;
+    if (!message || !prompt_id) return fail(res, "message and prompt_id required");
+    const turn = await pipeline.runTurn({ userId: req.user.user_id, promptId: prompt_id, message, flag: "docs", language });
+    const text = await lang.translate(turn.englishAnswer, turn.target);
+    const meta = await pipeline.finishTurn(turn, text);
+    res.json({ status: true, message: "Success", data: text, link: meta.citations.filter(c => c.cited), meta });
+  } catch (e) {
+    fail(res, e.message, e.code === 404 ? 404 : 500);
+  }
+});
 router.post("/contentPrompt/triggerLinkGraph", auth, (req, res) => fail(res, "Coming soon."));
 router.post("/contentPrompt/triggerAttachmentGraph", auth, (req, res) => fail(res, "Coming soon."));
 
 // ── Stubs for everything else the frontend calls ──────────────────────────────
 router.use("/stocks", quotes.router);
 router.get("/stocks/getSuggestionPrompts", auth, (req, res) => ok(res, []));
-const TRENDING_IN = [
-  { name: "HDFC Bank",                     stock_ticker: "HDFCBANK",   stock_relevance: "+1.2%", reason: "Strong Q4 results and steady loan growth" },
-  { name: "ICICI Bank",                    stock_ticker: "ICICIBANK",  stock_relevance: "+0.9%", reason: "Broad-based credit growth and NIM expansion" },
-  { name: "State Bank of India",           stock_ticker: "SBIN",       stock_relevance: "+0.7%", reason: "Rising retail deposits and PSU capex tailwinds" },
-  { name: "Kotak Mahindra Bank",           stock_ticker: "KOTAKBANK",  stock_relevance: "-0.3%", reason: "Valuation concerns amid muted loan growth" },
-  { name: "Axis Bank",                     stock_ticker: "AXISBANK",   stock_relevance: "+1.1%", reason: "Improving asset quality and CASA ratio" },
-  { name: "Bajaj Finance",                 stock_ticker: "BAJFINANCE", stock_relevance: "+1.8%", reason: "AUM growth beat and strong collections" },
-  { name: "Bajaj Finserv",                 stock_ticker: "BAJAJFINSV", stock_relevance: "+1.5%", reason: "Diversified NBFC play benefiting from credit cycle" },
-  { name: "Tata Consultancy Services",     stock_ticker: "TCS",        stock_relevance: "+0.6%", reason: "Resilient margins and large deal wins" },
-  { name: "Infosys",                       stock_ticker: "INFY",       stock_relevance: "+0.4%", reason: "Guidance in-line; AI deal pipeline expanding" },
-  { name: "HCL Technologies",             stock_ticker: "HCLTECH",    stock_relevance: "+0.8%", reason: "ER&D segment outperforming peers" },
-  { name: "Wipro",                         stock_ticker: "WIPRO",      stock_relevance: "-0.2%", reason: "Slow BFSI vertical recovery weighing on growth" },
-  { name: "Reliance Industries",           stock_ticker: "RELIANCE",   stock_relevance: "+1.3%", reason: "Jio subscriber additions and O2C margin recovery" },
-  { name: "Larsen & Toubro",              stock_ticker: "LT",         stock_relevance: "+1.0%", reason: "Record order inflows from infra and defence" },
-  { name: "NTPC",                          stock_ticker: "NTPC",       stock_relevance: "+0.5%", reason: "Capacity additions and renewable energy push" },
-  { name: "Power Grid Corporation",        stock_ticker: "POWERGRID",  stock_relevance: "+0.4%", reason: "Steady regulated returns and transmission capex" },
-  { name: "Adani Enterprises",             stock_ticker: "ADANIENT",   stock_relevance: "+2.1%", reason: "Airport and green energy businesses scaling up" },
-  { name: "Adani Ports & SEZ",             stock_ticker: "ADANIPORTS", stock_relevance: "+1.6%", reason: "Cargo volume growth and port acquisitions" },
-  { name: "Maruti Suzuki",                 stock_ticker: "MARUTI",     stock_relevance: "+0.9%", reason: "Strong SUV demand and CNG model launches" },
-  { name: "Tata Motors",                   stock_ticker: "TATAMOTORS", stock_relevance: "+1.4%", reason: "JLR recovery and EV market share gains" },
-  { name: "Mahindra & Mahindra",           stock_ticker: "M&M",        stock_relevance: "+1.7%", reason: "SUV segment dominance and EV order book" },
-  { name: "Hindustan Unilever",            stock_ticker: "HINDUNILVR", stock_relevance: "+0.3%", reason: "Rural demand revival supporting volume growth" },
-  { name: "ITC",                           stock_ticker: "ITC",        stock_relevance: "+0.6%", reason: "Cigarette volume resilience and FMCG scale-up" },
-  { name: "Nestlé India",                  stock_ticker: "NESTLEIND",  stock_relevance: "+0.5%", reason: "Premium product mix and distribution expansion" },
-  { name: "Britannia Industries",          stock_ticker: "BRITANNIA",  stock_relevance: "+0.4%", reason: "Margin improvement on lower commodity costs" },
-  { name: "Sun Pharmaceutical",            stock_ticker: "SUNPHARMA",  stock_relevance: "+1.2%", reason: "US specialty portfolio and emerging market growth" },
-];
-
-const TRENDING_US = [
-  { name: "Apple",                         stock_ticker: "AAPL",  stock_relevance: "+0.8%", reason: "iPhone cycle and Services revenue growth" },
-  { name: "Microsoft",                     stock_ticker: "MSFT",  stock_relevance: "+1.1%", reason: "Azure AI adoption and Copilot monetisation" },
-  { name: "Nvidia",                        stock_ticker: "NVDA",  stock_relevance: "+3.2%", reason: "Data centre GPU demand driven by AI buildout" },
-  { name: "Alphabet",                      stock_ticker: "GOOGL", stock_relevance: "+1.0%", reason: "Search resilience and Cloud revenue acceleration" },
-  { name: "Amazon",                        stock_ticker: "AMZN",  stock_relevance: "+1.4%", reason: "AWS growth and advertising segment profitability" },
-  { name: "Meta Platforms",               stock_ticker: "META",  stock_relevance: "+1.9%", reason: "Ad market rebound and Llama AI integration" },
-  { name: "Broadcom",                      stock_ticker: "AVGO",  stock_relevance: "+2.4%", reason: "Custom AI chip deals and VMware integration" },
-  { name: "AMD",                           stock_ticker: "AMD",   stock_relevance: "+2.1%", reason: "MI300 AI accelerator gaining data centre share" },
-  { name: "Intel",                         stock_ticker: "INTC",  stock_relevance: "-0.9%", reason: "Foundry losses and PC market recovery lag" },
-  { name: "TSMC",                          stock_ticker: "TSM",   stock_relevance: "+1.8%", reason: "Advanced node demand from AI chip designers" },
-  { name: "Berkshire Hathaway",            stock_ticker: "BRK.B", stock_relevance: "+0.6%", reason: "Cash pile deployment and insurance earnings" },
-  { name: "JPMorgan Chase",               stock_ticker: "JPM",   stock_relevance: "+0.7%", reason: "NII strength and investment banking recovery" },
-  { name: "Bank of America",              stock_ticker: "BAC",   stock_relevance: "+0.5%", reason: "Rate sensitivity advantage in higher-for-longer" },
-  { name: "Mastercard",                    stock_ticker: "MA",    stock_relevance: "+0.9%", reason: "Cross-border volume growth and value-added services" },
-  { name: "Visa",                          stock_ticker: "V",     stock_relevance: "+0.8%", reason: "Payments volume resilient amid global travel" },
-  { name: "Procter & Gamble",             stock_ticker: "PG",    stock_relevance: "+0.3%", reason: "Pricing power and emerging market volume growth" },
-  { name: "Coca-Cola",                     stock_ticker: "KO",    stock_relevance: "+0.2%", reason: "Defensive play with strong dividend yield" },
-  { name: "PepsiCo",                       stock_ticker: "PEP",   stock_relevance: "+0.1%", reason: "Snack segment offsetting beverage softness" },
-  { name: "Costco",                        stock_ticker: "COST",  stock_relevance: "+1.2%", reason: "Membership fee hike and warehouse expansion" },
-  { name: "Johnson & Johnson",            stock_ticker: "JNJ",   stock_relevance: "+0.4%", reason: "MedTech growth and oncology pipeline progress" },
-  { name: "Eli Lilly",                     stock_ticker: "LLY",   stock_relevance: "+2.8%", reason: "GLP-1 weight-loss drug demand surging globally" },
-  { name: "Pfizer",                        stock_ticker: "PFE",   stock_relevance: "-0.6%", reason: "Post-COVID revenue normalisation and pipeline risk" },
-  { name: "Tesla",                         stock_ticker: "TSLA",  stock_relevance: "+2.3%", reason: "FSD progress and energy storage record deployments" },
-  { name: "Walt Disney",                   stock_ticker: "DIS",   stock_relevance: "+0.7%", reason: "Streaming profitability and parks demand recovery" },
-  { name: "T-Mobile",                      stock_ticker: "TMUS",  stock_relevance: "+0.5%", reason: "Network leadership and subscriber momentum" },
-];
-
-const STANDOUT_IN = [
-  { name: "Reliance Industries",       stock_ticker: "RELIANCE",   stock_relevance: "+1.3%", reason: "Jio subscriber additions and O2C margin recovery" },
-  { name: "Tata Consultancy Services", stock_ticker: "TCS",        stock_relevance: "+0.6%", reason: "Resilient margins and large deal wins" },
-  { name: "HDFC Bank",                 stock_ticker: "HDFCBANK",   stock_relevance: "+1.2%", reason: "Strong Q4 results and steady loan growth" },
-  { name: "ICICI Bank",                stock_ticker: "ICICIBANK",  stock_relevance: "+0.9%", reason: "Broad-based credit growth and NIM expansion" },
-  { name: "Infosys",                   stock_ticker: "INFY",       stock_relevance: "+0.4%", reason: "Guidance in-line; AI deal pipeline expanding" },
-  { name: "State Bank of India",       stock_ticker: "SBIN",       stock_relevance: "+0.7%", reason: "Rising retail deposits and PSU capex tailwinds" },
-  { name: "Axis Bank",                 stock_ticker: "AXISBANK",   stock_relevance: "+1.1%", reason: "Improving asset quality and CASA ratio" },
-  { name: "Bajaj Finance",             stock_ticker: "BAJFINANCE", stock_relevance: "+1.8%", reason: "AUM growth beat and strong collections" },
-  { name: "Larsen & Toubro",           stock_ticker: "LT",         stock_relevance: "+1.0%", reason: "Record order inflows from infra and defence" },
-  { name: "NTPC",                      stock_ticker: "NTPC",       stock_relevance: "+0.5%", reason: "Capacity additions and renewable energy push" },
-  { name: "Power Grid Corporation",    stock_ticker: "POWERGRID",  stock_relevance: "+0.4%", reason: "Steady regulated returns and transmission capex" },
-  { name: "Maruti Suzuki",             stock_ticker: "MARUTI",     stock_relevance: "+0.9%", reason: "Strong SUV demand and CNG model launches" },
-  { name: "Tata Motors",               stock_ticker: "TATAMOTORS", stock_relevance: "+1.4%", reason: "JLR recovery and EV market share gains" },
-  { name: "Mahindra & Mahindra",       stock_ticker: "M&M",        stock_relevance: "+1.7%", reason: "SUV segment dominance and EV order book" },
-  { name: "Hindustan Unilever",        stock_ticker: "HINDUNILVR", stock_relevance: "+0.3%", reason: "Rural demand revival supporting volume growth" },
-  { name: "ITC",                       stock_ticker: "ITC",        stock_relevance: "+0.6%", reason: "Cigarette volume resilience and FMCG scale-up" },
-  { name: "Zomato",                    stock_ticker: "ZOMATO",     stock_relevance: "+2.4%", reason: "Hyperpure and quick commerce scaling rapidly" },
-  { name: "Nykaa",                     stock_ticker: "NYKAA",      stock_relevance: "+1.9%", reason: "Beauty GMV growth and profitability inflection" },
-  { name: "Adani Enterprises",         stock_ticker: "ADANIENT",   stock_relevance: "+2.1%", reason: "Airport and green energy businesses scaling up" },
-  { name: "Adani Green Energy",        stock_ticker: "ADANIGREEN", stock_relevance: "+1.8%", reason: "Renewable capacity additions ahead of schedule" },
-];
-
-const STANDOUT_US = [
-  { name: "Apple",                     stock_ticker: "AAPL",  stock_relevance: "+0.8%", reason: "iPhone cycle and Services revenue growth" },
-  { name: "Microsoft",                 stock_ticker: "MSFT",  stock_relevance: "+1.1%", reason: "Azure AI adoption and Copilot monetisation" },
-  { name: "NVIDIA",                    stock_ticker: "NVDA",  stock_relevance: "+3.2%", reason: "Data centre GPU demand driven by AI buildout" },
-  { name: "Amazon",                    stock_ticker: "AMZN",  stock_relevance: "+1.4%", reason: "AWS growth and advertising segment profitability" },
-  { name: "Alphabet",                  stock_ticker: "GOOGL", stock_relevance: "+1.0%", reason: "Search resilience and Cloud revenue acceleration" },
-  { name: "Meta Platforms",            stock_ticker: "META",  stock_relevance: "+1.9%", reason: "Ad market rebound and Llama AI integration" },
-  { name: "Tesla",                     stock_ticker: "TSLA",  stock_relevance: "+2.3%", reason: "FSD progress and energy storage record deployments" },
-  { name: "Netflix",                   stock_ticker: "NFLX",  stock_relevance: "+1.6%", reason: "Ad-supported tier growth and password sharing crackdown" },
-  { name: "Palantir",                  stock_ticker: "PLTR",  stock_relevance: "+3.8%", reason: "AIP enterprise AI contracts accelerating" },
-  { name: "Snowflake",                 stock_ticker: "SNOW",  stock_relevance: "+2.1%", reason: "Data cloud consumption growth and AI workloads" },
-  { name: "Advanced Micro Devices",    stock_ticker: "AMD",   stock_relevance: "+2.1%", reason: "MI300 AI accelerator gaining data centre share" },
-  { name: "Broadcom",                  stock_ticker: "AVGO",  stock_relevance: "+2.4%", reason: "Custom AI chip deals and VMware integration" },
-  { name: "JPMorgan Chase",            stock_ticker: "JPM",   stock_relevance: "+0.7%", reason: "NII strength and investment banking recovery" },
-  { name: "Goldman Sachs",             stock_ticker: "GS",    stock_relevance: "+0.9%", reason: "Trading revenue surge and M&A pipeline rebuilding" },
-  { name: "Eli Lilly",                 stock_ticker: "LLY",   stock_relevance: "+2.8%", reason: "GLP-1 weight-loss drug demand surging globally" },
-  { name: "Johnson & Johnson",         stock_ticker: "JNJ",   stock_relevance: "+0.4%", reason: "MedTech growth and oncology pipeline progress" },
-  { name: "Coca-Cola",                 stock_ticker: "KO",    stock_relevance: "+0.2%", reason: "Defensive play with strong dividend yield" },
-  { name: "Walmart",                   stock_ticker: "WMT",   stock_relevance: "+0.8%", reason: "E-commerce share gains and advertising business growth" },
-  { name: "ExxonMobil",               stock_ticker: "XOM",   stock_relevance: "+0.6%", reason: "Pioneer acquisition synergies and Permian growth" },
-  { name: "Chevron",                   stock_ticker: "CVX",   stock_relevance: "+0.5%", reason: "Hess deal and strong free cash flow generation" },
-];
-
-router.get("/stocks/trending", auth, (req, res) => {
-  const market = (req.query.market || "IN").toUpperCase();
-  ok(res, market === "US" ? TRENDING_US : TRENDING_IN);
-});
+router.use("/stocks", market.legacyRouter);
 
 router.get("/stocks/indexes", auth, (req, res) => ok(res, []));
 router.get("/stocks/sp500", auth, (req, res) => ok(res, []));
@@ -584,132 +387,14 @@ router.get("/stocks/getFinancialsPeers", auth, (req, res) => ok(res, []));
 router.get("/stocks/getFinancialsShareHolding", auth, (req, res) => ok(res, null));
 router.get("/stocks/getStockRevenue", auth, (req, res) => ok(res, null));
 router.get("/stocks/getFinancialsResults", auth, (req, res) => ok(res, null));
-router.get("/stocks/fetchTrendingStocksFromAI", auth, (req, res) => {
-  const market = (req.query.market || "IN").toUpperCase();
-  ok(res, market === "US" ? STANDOUT_US : STANDOUT_IN);
-});
-const MARKET_SUMMARY_IN = {
-  last_updated_utc: new Date().toISOString(),
-  market_drivers: {
-    summary: "India's equity markets, represented by the Nifty 50 and Sensex, are currently navigating a phase of consolidation after a strong multi-month rally that pushed valuations toward the higher end of historical ranges. Recent sessions have been marked by increased volatility, driven largely by profit booking, intermittent foreign institutional investor outflows, and sector-specific weakness, particularly in information technology stocks facing softer global demand and cautious client spending. Rising crude oil prices have added another layer of concern, as India's status as a major oil importer makes its inflation and fiscal outlook sensitive to energy costs. Despite these near-term headwinds, domestic fundamentals remain supportive, with steady GDP growth, resilient consumption, improving corporate balance sheets, and continued government-led infrastructure spending underpinning the broader market outlook.",
-  },
-  market_summary: {
-    summary_points: [
-      { title: "Valuation Consolidation", summary: "Nifty 50 and Sensex pulling back from elevated levels after a strong multi-month rally; profit booking driving near-term volatility." },
-      { title: "FII Outflows", summary: "Intermittent foreign institutional investor selling adding selling pressure, particularly in large-cap IT and financial names." },
-      { title: "Crude Oil Risk", summary: "Rising crude prices pose an upside risk to India's inflation and fiscal deficit, given its status as a major oil importer." },
-      { title: "Domestic Fundamentals", summary: "Steady GDP growth, resilient consumption, and improving corporate balance sheets continue to support the medium-term market outlook." },
-      { title: "Banking & Financials", summary: "Relatively stable on the back of strong credit growth; NIM expansion and improving asset quality lending support to sector." },
-      { title: "Capex & Infrastructure", summary: "Capital goods and power sectors outperforming, driven by the ongoing government-led investment and infrastructure spending cycle." },
-    ],
-    sources: [],
-  },
-  standouts_analysis: {
-    gainers: [
-      { stock: "Larsen & Toubro",      reason: "Record order inflows from infrastructure and defence sectors driving strong earnings visibility." },
-      { stock: "NTPC",                  reason: "Renewable capacity additions on track; power sector benefiting from rising electricity demand." },
-      { stock: "Bajaj Finance",         reason: "AUM growth beat expectations; collections and asset quality remain healthy." },
-      { stock: "Tata Motors",           reason: "JLR recovery gaining momentum; EV market share expanding domestically." },
-    ],
-    losers: [
-      { stock: "Infosys",               reason: "Softer global IT demand and cautious client spending weighing on revenue growth guidance." },
-      { stock: "Wipro",                 reason: "BFSI vertical recovery slower than peers; deal ramp-ups delayed by client budget freezes." },
-      { stock: "HCL Technologies",      reason: "Margin pressure from wage hikes offsetting ER&D segment outperformance." },
-    ],
-  },
-  sector_analysis: {
-    top_performing_sectors: [
-      { sector: "Banking & Financials", reason: "Strong credit growth, NIM expansion, and improving asset quality supporting sector outperformance." },
-      { sector: "Capital Goods",        reason: "Government infrastructure push driving record order books for engineering and construction companies." },
-      { sector: "Power & Energy",       reason: "Rising electricity demand and renewable capacity additions; NTPC and Power Grid in focus." },
-      { sector: "Automobiles",          reason: "SUV demand robust; EV transition accelerating with Tata Motors and M&M leading." },
-    ],
-    underperforming_sectors: [
-      { sector: "Information Technology", reason: "Softer global demand, cautious client budgets, and FII selling weighing on IT stocks." },
-      { sector: "Oil & Gas (downstream)", reason: "Rising crude input costs squeezing margins for refiners and downstream players." },
-    ],
-    top_performers: [
-      { sector: "Banking & Financials", reason: "Strong credit growth, NIM expansion, and improving asset quality." },
-      { sector: "Capital Goods",        reason: "Record infrastructure order inflows from government capex cycle." },
-      { sector: "Power",                reason: "Capacity additions and rising electricity demand driving earnings growth." },
-      { sector: "Automobiles",          reason: "Robust SUV and EV demand supporting volume and margin expansion." },
-    ],
-  },
-  latest_news: {
-    articles: [
-      { title: "Nifty consolidates near highs amid FII outflows", snippet: "Markets saw profit booking as foreign investors continued to sell Indian equities for the third consecutive session.", age: "2 hours ago" },
-      { title: "Bajaj Finance Q4 results beat estimates on AUM growth", snippet: "The NBFC reported strong asset quality and collections, pushing the stock to a fresh 52-week high.", age: "4 hours ago" },
-      { title: "Crude oil crosses $90 — impact on India's fiscal math", snippet: "Rising energy prices raise concerns about India's current account deficit and inflation trajectory.", age: "6 hours ago" },
-      { title: "L&T wins ₹12,000 Cr infrastructure order from NHAI", snippet: "Larsen & Toubro secured one of its largest single road infrastructure contracts, boosting its order book.", age: "8 hours ago" },
-      { title: "IT sector outlook cautious as global spending slows", snippet: "Analysts trim FY25 earnings estimates for top-tier IT companies citing delayed deal ramp-ups.", age: "10 hours ago" },
-    ],
-  },
-};
-
-const MARKET_SUMMARY_US = {
-  last_updated_utc: new Date().toISOString(),
-  market_drivers: {
-    summary: "In the United States, equity markets led by the S&P 500 and Nasdaq Composite continue to exhibit strong upward momentum, supported by robust corporate earnings and sustained investor enthusiasm for artificial intelligence and large-cap technology companies. The rally has been concentrated among a handful of mega-cap firms, whose earnings growth and innovation narratives have driven index performance to near-record levels. At the same time, the broader economy has shown resilience, with steady consumer spending and a relatively stable labor market helping offset concerns about higher interest rates. However, risks remain on the horizon, including uncertainty over future Federal Reserve policy decisions, elevated market valuations—particularly in the technology sector—and potential shocks from geopolitical developments or energy price fluctuations.",
-  },
-  market_summary: {
-    summary_points: [
-      { title: "AI-Driven Rally", summary: "Mega-cap tech and AI infrastructure companies driving the S&P 500 and Nasdaq to near-record levels on earnings beats and forward guidance." },
-      { title: "Concentrated Leadership", summary: "Market gains concentrated in a handful of large-cap names; equal-weight S&P 500 lagging the cap-weighted index significantly." },
-      { title: "Resilient Economy", summary: "Consumer spending and labor market remain stable, reducing recession risk and supporting corporate earnings expectations." },
-      { title: "Fed Policy Uncertainty", summary: "Timing of Federal Reserve rate cuts remains a key market variable; strong data pushing expectations for cuts further out." },
-      { title: "Valuation Concerns", summary: "Technology sector trading at elevated multiples; forward P/E ratios above historical averages raising risk of de-rating." },
-      { title: "Geopolitical & Energy Risk", summary: "Potential shocks from Middle East tensions or energy price spikes could disrupt current benign inflation narrative." },
-    ],
-    sources: [],
-  },
-  standouts_analysis: {
-    gainers: [
-      { stock: "NVIDIA",        reason: "Data centre GPU demand at record highs; AI buildout driving earnings far ahead of consensus estimates." },
-      { stock: "Meta Platforms", reason: "Ad market recovery and Llama AI model monetisation driving margin expansion and strong EPS growth." },
-      { stock: "Eli Lilly",     reason: "GLP-1 weight-loss drug (Mounjaro/Zepbound) demand surging globally; guidance raised multiple times." },
-      { stock: "Palantir",      reason: "AIP enterprise AI platform contracts accelerating; US commercial revenue growing at 70%+ YoY." },
-    ],
-    losers: [
-      { stock: "Intel",  reason: "Foundry division losses widening; PC market recovery slower than expected." },
-      { stock: "Pfizer", reason: "Post-COVID revenue normalisation; pipeline setbacks weighing on near-term growth outlook." },
-    ],
-  },
-  sector_analysis: {
-    top_performing_sectors: [
-      { sector: "Technology & AI",      reason: "Mega-cap tech earnings beats and AI capex cycle driving sector to near-record valuations." },
-      { sector: "Semiconductors",       reason: "AI chip demand — especially NVIDIA and Broadcom — driving the strongest earnings cycle in years." },
-      { sector: "Healthcare (GLP-1)",   reason: "Eli Lilly and obesity drug theme dominating healthcare sector performance and fund flows." },
-      { sector: "Financials",           reason: "Higher-for-longer rates benefiting net interest income; M&A advisory pipeline rebuilding." },
-    ],
-    underperforming_sectors: [
-      { sector: "Consumer Staples",  reason: "Defensive sector lagging as risk-on sentiment persists; margin pressure from input cost normalisation." },
-      { sector: "Utilities",         reason: "Rate-sensitive sector underperforming as Fed cut expectations get pushed further out." },
-    ],
-    top_performers: [
-      { sector: "Technology & AI",    reason: "AI narrative and mega-cap earnings driving index returns; most concentrated rally in decades." },
-      { sector: "Semiconductors",     reason: "NVIDIA, Broadcom, and AMD benefiting from insatiable demand for AI training and inference chips." },
-      { sector: "Healthcare",         reason: "GLP-1 obesity drug theme creating a new multi-year growth cycle for select pharma companies." },
-      { sector: "Financials",         reason: "Higher rates and improving deal flow supporting investment banks and regional lenders." },
-    ],
-  },
-  latest_news: {
-    articles: [
-      { title: "S&P 500 hits record high on NVIDIA earnings beat", snippet: "NVIDIA's blowout quarterly results pushed the broader index to all-time highs as AI optimism surged.", age: "2 hours ago" },
-      { title: "Fed signals patience on rate cuts amid strong jobs data", snippet: "Federal Reserve officials reiterated a data-dependent stance, pushing rate cut expectations to Q4 2025.", age: "4 hours ago" },
-      { title: "Meta Platforms raises full-year guidance on AI ad revenue", snippet: "Strong advertising revenue and AI-driven engagement gains drove Meta shares up 8% post-earnings.", age: "6 hours ago" },
-      { title: "Eli Lilly GLP-1 sales top $5B for the first time in a quarter", snippet: "Mounjaro and Zepbound combined sales exceeded analyst estimates, reinforcing the obesity drug supercycle thesis.", age: "8 hours ago" },
-      { title: "Intel reports wider-than-expected foundry losses", snippet: "The chip giant's manufacturing division continues to weigh on overall profitability despite cost reduction efforts.", age: "10 hours ago" },
-    ],
-  },
-};
-
-router.get("/stocks/getTrendingDashboardData", auth, (req, res) => {
-  const market = (req.query.market || "IN").toUpperCase();
-  const data = market === "US" ? MARKET_SUMMARY_US : MARKET_SUMMARY_IN;
-  ok(res, { data: [{ data }] });
-});
 router.use("/portfolio", portfolio.router);
 router.use("/news", news.router);
+router.use("/documents", documents.router);
+router.use("/answers", answers.router);
+router.use("/review", answers.reviewRouter);
+router.use("/market", market.router);
+router.use("/voice", voice.router);
+router.get("/rag/stats", auth, async (req, res) => ok(res, await rag.stats()));
 router.get("/news/trending", auth, (req, res) => ok(res, []));
 router.get("/news/reference", auth, (req, res) => ok(res, []));
 router.get("/news/fetchAllNews", auth, (req, res) => ok(res, []));
@@ -745,7 +430,7 @@ app.get("/", (req, res) => res.send("Frruit AI Backend running"));
 // SOCKET.IO — Streaming Chat
 // ═══════════════════════════════════════════════════════════════════════════════
 
-io.of("/chat").use((socket, next) => {
+function socketAuth(socket, next) {
   try {
     const token = socket.handshake.auth.token;
     if (!token) return next(new Error("Unauthorized"));
@@ -755,28 +440,23 @@ io.of("/chat").use((socket, next) => {
   } catch {
     next(new Error("Invalid token"));
   }
-});
+}
 
+io.of("/chat").use(socketAuth);
+
+// Events: "stage" { stage } while working → "response" { data } chunks → "end" { data: sources, meta }
 io.of("/chat").on("connection", (socket) => {
   socket.on("chatStream", async ({ message, prompt_id, flag, language }) => {
     try {
       const userId = socket.user.user_id;
-
-      const pr = await pool.query(
-        `SELECT 1 FROM ai_prompts WHERE prompt_id=$1 AND user_id=$2 AND active=true`,
-        [prompt_id, userId]
-      );
-      if (!pr.rowCount) {
-        socket.emit("error", { message: "Prompt not found" });
-        return socket.disconnect();
-      }
-
-      // The web search model returns the full English answer + url citations
-      const turn = await prepareTurn({ userId, promptId: prompt_id, message, flag, language });
+      const turn = await pipeline.runTurn({
+        userId, promptId: prompt_id, message, flag, language,
+        onStage: (stage, info) => socket.emit("stage", { stage, ...(info || {}) }),
+      });
 
       let answer;
       if (turn.target.code === "en") {
-        // Fake-stream: emit in chunks so UI animates normally
+        // The answer is complete and verified before streaming, so stream it in chunks for the UI animation
         answer = turn.englishAnswer;
         const CHUNK = 25;
         for (let i = 0; i < answer.length; i += CHUNK) {
@@ -785,28 +465,38 @@ io.of("/chat").on("connection", (socket) => {
         }
       } else {
         // Real stream of the translation back into the user's language
+        socket.emit("stage", { stage: "translating", language: turn.target.name });
         answer = await lang.translate(turn.englishAnswer, turn.target, (delta) => socket.emit("response", { data: delta }));
       }
 
-      const meta = await saveBotAnswer({ userId, promptId: prompt_id, flag, answer, turn });
-
-      socket.emit("end", { data: turn.sources, meta });
+      const meta = await pipeline.finishTurn(turn, answer);
+      socket.emit("end", { data: meta.citations.filter(c => c.cited), meta });
       socket.disconnect();
     } catch (err) {
       console.error("Stream error:", err.message);
-      socket.emit("error", { message: "Something went wrong. Please try again." });
+      socket.emit("error", { message: err.code === 404 ? "Prompt not found" : "Something went wrong. Please try again." });
       socket.disconnect();
     }
   });
 });
 
+// Live updates for the dashboard and news feed: "news:new", "market:movers", "market:summary"
+live.use(socketAuth);
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 initDB()
   .then(news.initDB)
   .then(portfolio.initDB)
+  .then(rag.initDB)
+  .then(answers.initDB)
+  .then(market.initDB)
+  .then(documents.initStorage)
   .then(() => server.listen(PORT, () => {
     news.start();
     quotes.start();
+    market.start();
+    rag.resumePending();
+    rag.syncNews();
     console.log(`\n🚀  Frruit AI Backend  →  http://localhost:${PORT}`);
     console.log(`📡  Socket.IO          →  http://localhost:${PORT}/chat`);
     console.log(`📧  OTPs sent via ${process.env.SMTP_USER}\n`);
