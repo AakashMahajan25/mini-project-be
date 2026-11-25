@@ -8,6 +8,10 @@ const { Pool } = require("pg");
 const OpenAI = require("openai");
 const cors = require("cors");
 const nodemailer = require("nodemailer");
+const createNews = require("./news");
+const createQuotes = require("./quotes");
+const createLanguage = require("./language");
+const createPortfolio = require("./portfolio");
 require("dotenv").config();
 
 const app = express();
@@ -77,6 +81,9 @@ async function initDB() {
       active      BOOLEAN DEFAULT true,
       "createdAt" TIMESTAMPTZ DEFAULT NOW()
     );
+    -- Multilingual: language of the row's text, and the English version the model works with
+    ALTER TABLE ai_prompt_history ADD COLUMN IF NOT EXISTS language TEXT;
+    ALTER TABLE ai_prompt_history ADD COLUMN IF NOT EXISTS text_en  TEXT;
   `);
   console.log("✅ DB tables ready");
 }
@@ -115,6 +122,13 @@ function auth(req, res, next) {
   }
 }
 
+const news = createNews({ pool, openai, auth, ok, fail });
+const quotes = createQuotes({ auth, ok, fail });
+const lang = createLanguage({ openai });
+const portfolio = createPortfolio({ pool, openai, auth, ok, fail, quotes });
+
+const CHAT_MODEL = process.env.CHAT_MODEL || "gpt-5-search-api";
+
 // ─── System Prompts ───────────────────────────────────────────────────────────
 const SYSTEM_PROMPTS = {
   fund:     "You are a financial analyst specializing in Indian and US stock markets. Answer questions about company fundamentals, financial ratios, earnings, and valuations. Be concise and accurate.",
@@ -123,12 +137,23 @@ const SYSTEM_PROMPTS = {
   youtube:  "You are a financial content analyst. Summarize and explain financial content clearly and concisely.",
   reddit:   "You are a market sentiment analyst. Provide balanced insights on investor sentiment and market discussions.",
   screener: "You are a stock screening analyst. Help users find and analyze stocks based on financial criteria.",
+  portfolio: [
+    "You are Frruit's portfolio analyst. The user's holdings, valued at live prices, are listed below.",
+    "Those figures are authoritative: use them exactly for any value, P&L, return, weight or allocation, never recompute them differently, and never invent holdings the user does not have.",
+    "Use web search for recent news, results, guidance or events affecting these holdings when the question calls for it, and cite the sources.",
+    "Explain risks factually: concentration, sector exposure, volatility (beta), valuation (P/E), currency exposure, upcoming earnings.",
+    "Do not tell the user to buy, sell or hold any security and give no price targets; frame observations as points to consider.",
+    "If the data below cannot answer the question, say what is missing. Do not add a disclaimer; one is appended automatically.",
+  ].join(" "),
   default:  "You are a helpful financial assistant specializing in stock markets, investment analysis, and financial planning.",
 };
 
 function sysPrompt(flag) {
   return SYSTEM_PROMPTS[flag] || SYSTEM_PROMPTS.default;
 }
+
+const PORTFOLIO_DISCLAIMER = "_This is informational analysis of your holdings, not investment advice._";
+const EMPTY_PORTFOLIO_ANSWER = "Your portfolio is empty, so there is nothing to analyse yet. Add your holdings on the **Portfolio** page (symbol, quantity and average buy price), then ask again.";
 
 function extractSources(annotations = []) {
   if (!Array.isArray(annotations)) return [];
@@ -141,14 +166,73 @@ function extractSources(annotations = []) {
     }));
 }
 
+// Latest `limit` turns, oldest first, in English (the model always works in English)
 async function getHistory(userId, promptId, limit = 10) {
   const r = await pool.query(
-    `SELECT person, text FROM ai_prompt_history
-     WHERE user_id=$1 AND prompt_id=$2 AND active=true
-     ORDER BY id ASC LIMIT $3`,
+    `SELECT person, COALESCE(text_en, text) AS text FROM ai_prompt_history
+     WHERE user_id=$1 AND prompt_id=$2 AND active=true AND type='text'
+     ORDER BY id DESC LIMIT $3`,
     [userId, promptId, limit]
   );
-  return r.rows;
+  return r.rows.reverse();
+}
+
+// One chat turn through the multilingual pipeline:
+// detect language → translate question to English → answer in English (web search, plus
+// portfolio context for the portfolio focus) → caller translates the answer back.
+// Saves the user's message; returns the English answer for the caller to translate and save.
+async function prepareTurn({ userId, promptId, message, flag, language }) {
+  const detected = await lang.detect(message);
+  const target = lang.resolveTarget(language, detected);
+  const history = await getHistory(userId, promptId);
+
+  await pool.query(
+    `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, language, text_en)
+     VALUES($1,$2,'user',$3,'text',$4,$5,$6)`,
+    [userId, promptId, message, flag, detected.code, detected.english !== message ? detected.english : null]
+  );
+
+  let context = null;
+  if (flag === "portfolio") {
+    context = await portfolio.buildContext(userId);
+    if (context.empty) return { englishAnswer: EMPTY_PORTFOLIO_ANSWER, sources: [], detected, target };
+  }
+
+  const system = [
+    sysPrompt(flag),
+    detected.code !== "en" ? `The user's message was translated from ${detected.name}. Answer in English; the answer is translated for them afterwards.` : null,
+    context?.text,
+  ].filter(Boolean).join("\n\n");
+
+  const completion = await openai.chat.completions.create({
+    model: CHAT_MODEL,
+    messages: [
+      { role: "system", content: system },
+      ...history.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
+      { role: "user", content: detected.english },
+    ],
+    web_search_options: {},
+  });
+  const msg = completion.choices[0].message;
+  let englishAnswer = msg.content || "";
+  if (flag === "portfolio") englishAnswer = `${englishAnswer.trim()}\n\n${PORTFOLIO_DISCLAIMER}`;
+  return { englishAnswer, sources: extractSources(msg.annotations), detected, target };
+}
+
+async function saveBotAnswer({ userId, promptId, flag, answer, turn }) {
+  const translated = turn.target.code !== "en";
+  await pool.query(
+    `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, link, language, text_en)
+     VALUES($1,$2,'bot',$3,'text',$4,$5,$6,$7)`,
+    [userId, promptId, answer, flag, JSON.stringify(turn.sources), turn.target.code, translated ? turn.englishAnswer : null]
+  );
+  return {
+    language: turn.target.code,
+    language_name: turn.target.name,
+    detected_language: turn.detected.code,
+    translated,
+    text_en: translated ? turn.englishAnswer : null,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -290,7 +374,7 @@ router.get("/prompts/getPromptHistory", auth, async (req, res) => {
   const { prompt_id } = req.query;
   if (!prompt_id) return fail(res, "prompt_id required");
   const r = await pool.query(
-    `SELECT id as prompt_history_id, prompt_id, user_id, person, text, type, focus_type, link, active, "createdAt"
+    `SELECT id as prompt_history_id, prompt_id, user_id, person, text, type, focus_type, link, active, "createdAt", language, text_en
      FROM ai_prompt_history
      WHERE user_id=$1 AND prompt_id=$2 AND active=true
      ORDER BY id ASC`,
@@ -321,32 +405,21 @@ router.get("/prompts/searchSuggestedQuestionPrompts", auth, (req, res) => ok(res
 // REST chat (screener flag — uses web search)
 router.post("/prompts/triggerChat", auth, async (req, res) => {
   try {
-    const { message, prompt_id, flag } = req.body;
+    const { message, prompt_id, flag, language } = req.body;
     if (!message || !prompt_id) return fail(res, "message and prompt_id required");
+    const userId = req.user.user_id;
 
-    const hist = await getHistory(req.user.user_id, prompt_id);
-    const messages = [
-      { role: "system", content: sysPrompt(flag) },
-      ...hist.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
-      { role: "user", content: message },
-    ];
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-search-preview",
-      messages,
-      web_search_options: {},
-    });
-    const msg = completion.choices[0].message;
-    const text = msg.content;
-    const sources = extractSources(msg.annotations);
-
-    await pool.query(
-      `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, link)
-       VALUES($1,$2,'user',$3,'text',$4,'[]'),($1,$2,'bot',$5,'text',$4,$6)`,
-      [req.user.user_id, prompt_id, message, flag, text, JSON.stringify(sources)]
+    const pr = await pool.query(
+      `SELECT 1 FROM ai_prompts WHERE prompt_id=$1 AND user_id=$2 AND active=true`,
+      [prompt_id, userId]
     );
+    if (!pr.rowCount) return fail(res, "Prompt not found", 404);
 
-    ok(res, { data: text, link: sources, focus_type: flag });
+    const turn = await prepareTurn({ userId, promptId: prompt_id, message, flag, language });
+    const text = await lang.translate(turn.englishAnswer, turn.target);
+    const meta = await saveBotAnswer({ userId, promptId: prompt_id, flag, answer: text, turn });
+
+    ok(res, { data: text, link: turn.sources, focus_type: flag, ...meta });
   } catch (e) {
     fail(res, e.message, 500);
   }
@@ -391,6 +464,7 @@ router.post("/contentPrompt/triggerLinkGraph", auth, (req, res) => fail(res, "Co
 router.post("/contentPrompt/triggerAttachmentGraph", auth, (req, res) => fail(res, "Coming soon."));
 
 // ── Stubs for everything else the frontend calls ──────────────────────────────
+router.use("/stocks", quotes.router);
 router.get("/stocks/getSuggestionPrompts", auth, (req, res) => ok(res, []));
 const TRENDING_IN = [
   { name: "HDFC Bank",                     stock_ticker: "HDFCBANK",   stock_relevance: "+1.2%", reason: "Strong Q4 results and steady loan growth" },
@@ -634,6 +708,8 @@ router.get("/stocks/getTrendingDashboardData", auth, (req, res) => {
   const data = market === "US" ? MARKET_SUMMARY_US : MARKET_SUMMARY_IN;
   ok(res, { data: [{ data }] });
 });
+router.use("/portfolio", portfolio.router);
+router.use("/news", news.router);
 router.get("/news/trending", auth, (req, res) => ok(res, []));
 router.get("/news/reference", auth, (req, res) => ok(res, []));
 router.get("/news/fetchAllNews", auth, (req, res) => ok(res, []));
@@ -682,7 +758,7 @@ io.of("/chat").use((socket, next) => {
 });
 
 io.of("/chat").on("connection", (socket) => {
-  socket.on("chatStream", async ({ message, prompt_id, flag, market }) => {
+  socket.on("chatStream", async ({ message, prompt_id, flag, language }) => {
     try {
       const userId = socket.user.user_id;
 
@@ -695,46 +771,26 @@ io.of("/chat").on("connection", (socket) => {
         return socket.disconnect();
       }
 
-      // Save user message first
-      await pool.query(
-        `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type)
-         VALUES($1,$2,'user',$3,'text',$4)`,
-        [userId, prompt_id, message, flag]
-      );
+      // The web search model returns the full English answer + url citations
+      const turn = await prepareTurn({ userId, promptId: prompt_id, message, flag, language });
 
-      // Build messages with history
-      const hist = await getHistory(userId, prompt_id);
-      const messages = [
-        { role: "system", content: sysPrompt(flag) },
-        ...hist.map(r => ({ role: r.person === "bot" ? "assistant" : "user", content: r.text || "" })),
-        { role: "user", content: message },
-      ];
-
-      // Use web search model — returns full response + url citations
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o-search-preview",
-        messages,
-        web_search_options: {},
-      });
-      const msg = completion.choices[0].message;
-      const fullText = msg.content;
-      const sources = extractSources(msg.annotations);
-
-      // Fake-stream: emit in chunks so UI animates normally
-      const CHUNK = 25;
-      for (let i = 0; i < fullText.length; i += CHUNK) {
-        socket.emit("response", { data: fullText.slice(i, i + CHUNK) });
-        await new Promise(r => setTimeout(r, 15));
+      let answer;
+      if (turn.target.code === "en") {
+        // Fake-stream: emit in chunks so UI animates normally
+        answer = turn.englishAnswer;
+        const CHUNK = 25;
+        for (let i = 0; i < answer.length; i += CHUNK) {
+          socket.emit("response", { data: answer.slice(i, i + CHUNK) });
+          await new Promise(r => setTimeout(r, 15));
+        }
+      } else {
+        // Real stream of the translation back into the user's language
+        answer = await lang.translate(turn.englishAnswer, turn.target, (delta) => socket.emit("response", { data: delta }));
       }
 
-      // Save bot response
-      await pool.query(
-        `INSERT INTO ai_prompt_history(user_id, prompt_id, person, text, type, focus_type, link)
-         VALUES($1,$2,'bot',$3,'text',$4,$5)`,
-        [userId, prompt_id, fullText, flag, JSON.stringify(sources)]
-      );
+      const meta = await saveBotAnswer({ userId, promptId: prompt_id, flag, answer, turn });
 
-      socket.emit("end", { data: sources });
+      socket.emit("end", { data: turn.sources, meta });
       socket.disconnect();
     } catch (err) {
       console.error("Stream error:", err.message);
@@ -746,7 +802,11 @@ io.of("/chat").on("connection", (socket) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 initDB()
+  .then(news.initDB)
+  .then(portfolio.initDB)
   .then(() => server.listen(PORT, () => {
+    news.start();
+    quotes.start();
     console.log(`\n🚀  Frruit AI Backend  →  http://localhost:${PORT}`);
     console.log(`📡  Socket.IO          →  http://localhost:${PORT}/chat`);
     console.log(`📧  OTPs sent via ${process.env.SMTP_USER}\n`);
