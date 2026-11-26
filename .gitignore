@@ -69,3 +69,19 @@ typings/
 storage/
 # Evaluation reports (npm run eval)
 test/eval/results/
+
+# Secrets: never commit these
+.env.*
+!.env.example
+docker-compose.env
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Database dumps and backups
+*.sql
+*.dump
+*.backup
